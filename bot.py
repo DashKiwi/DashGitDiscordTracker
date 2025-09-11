@@ -47,7 +47,7 @@ async def init_db():
         await db.commit()
 
 # -------------------- GITHUB POLLING --------------------
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=1)
 async def check_commits():
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT id, github_username, discord_id, last_event_id FROM github_accounts")
@@ -59,6 +59,13 @@ async def check_commits():
         if not repos:
             print(f"No public repos found for {username}")
             continue
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT id, github_username, discord_id, last_event_id FROM github_accounts")
+            accounts = await cursor.fetchall()
+            for acc_id, username, discord_id, last_event_id in accounts:
+                print(f"🔹 {username} (Discord ID: {discord_id}) current last_event_id in DB: {last_event_id}")
+
 
         headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
         async with aiohttp.ClientSession() as session:
