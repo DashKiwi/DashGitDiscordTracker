@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import sys
 import asyncio
 import aiohttp
+from datetime import datetime
 
 # -------------------- WINDOWS EVENT LOOP FIX --------------------
 if sys.platform.startswith("win"):
@@ -71,7 +72,7 @@ async def check_commits():
                 for event in events:
                     if event["type"] == "PushEvent":
                         if last_event_id and event["id"] == last_event_id:
-                            break  # stop at last seen event
+                            break
                         new_events.append(event)
 
                 if new_events:
@@ -97,7 +98,7 @@ async def check_commits():
                     )
 
                     if channel:
-                        for event in reversed(new_events):  # post oldest first
+                        for event in reversed(new_events):
                             repo = event["repo"]["name"]
                             commit_msgs = [c["message"] for c in event["payload"]["commits"]]
                             msg = "\n".join([f"- {m}" for m in commit_msgs])
@@ -158,6 +159,111 @@ async def list_githubs(interaction: discord.Interaction, user: discord.Member = 
                 await interaction.response.send_message(msg)
             else:
                 await interaction.response.send_message("❌ No GitHub accounts linked yet.")
+
+@bot.tree.command(name="change_github", description="Change Discord account associated with a GitHub account")
+@commands.has_permissions(administrator=True)
+async def change_github(interaction: discord.Interaction, github_username: str, user: discord.Member):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE github_accounts SET discord_id = ? WHERE github_username = ?",
+            (user.id, github_username)
+        )
+        await db.commit()
+    await interaction.response.send_message(f"✅ **{github_username}** is now linked to {user.mention}")
+
+@bot.tree.command(name="current_streak", description="Show current contribution streak for a GitHub user")
+async def current_streak(interaction: discord.Interaction, github_username: str):
+    query = """
+    query($username: String!) {
+      user(login: $username) {
+        contributionsCollection {
+          contributionCalendar {
+            weeks {
+              contributionDays {
+                date
+                contributionCount
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    headers = {"Authorization": f"bearer {GITHUB_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.github.com/graphql", json={"query": query, "variables": {"username": github_username}}, headers=headers) as resp:
+            if resp.status != 200:
+                await interaction.response.send_message(f"⚠️ Failed to fetch data: {resp.status}")
+                return
+            data = await resp.json()
+    if "errors" in data:
+        await interaction.response.send_message(f"⚠️ Error: {data['errors'][0]['message']}")
+        return
+    weeks = data["data"]["user"]["contributionsCollection"]["contributionCalendar"]["weeks"]
+    streak = 0
+    counting = True
+    today = datetime.utcnow().date()
+    days = [day for week in weeks for day in week["contributionDays"]]
+    days = sorted(days, key=lambda x: x["date"], reverse=True)
+    for day in days:
+        day_date = datetime.strptime(day["date"], "%Y-%m-%d").date()
+        if day_date > today:
+            continue
+        if counting:
+            if day["contributionCount"] > 0:
+                streak += 1
+            else:
+                counting = False
+        else:
+            break
+    await interaction.response.send_message(f"🔥 **{github_username}** current contribution streak: **{streak} day(s)**")
+
+@bot.tree.command(name="streak_repo", description="Show current contribution streak for a user in a specific repository")
+async def streak_repo(interaction: discord.Interaction, github_username: str, repo_name: str):
+    query = """
+    query($username: String!, $repoName: String!) {
+      user(login: $username) {
+        contributionsCollection(repositoryName: $repoName) {
+          contributionCalendar {
+            weeks {
+              contributionDays {
+                date
+                contributionCount
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    headers = {"Authorization": f"bearer {GITHUB_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.github.com/graphql", json={"query": query, "variables": {"username": github_username, "repoName": repo_name}}, headers=headers) as resp:
+            if resp.status != 200:
+                await interaction.response.send_message(f"⚠️ Failed to fetch data: {resp.status}")
+                return
+            data = await resp.json()
+    if "errors" in data:
+        await interaction.response.send_message(f"⚠️ Error: {data['errors'][0]['message']}")
+        return
+    weeks = data["data"]["user"]["contributionsCollection"]["contributionCalendar"]["weeks"]
+    streak = 0
+    counting = True
+    today = datetime.utcnow().date()
+    days = [day for week in weeks for day in week["contributionDays"]]
+    days = sorted(days, key=lambda x: x["date"], reverse=True)
+    for day in days:
+        day_date = datetime.strptime(day["date"], "%Y-%m-%d").date()
+        if day_date > today:
+            continue
+        if counting:
+            if day["contributionCount"] > 0:
+                streak += 1
+            else:
+                counting = False
+        else:
+            break
+    await interaction.response.send_message(f"🔥 **{github_username}** streak in **{repo_name}**: **{streak} day(s)**")
 
 # -------------------- OPTIONAL: SET UPDATE CHANNEL --------------------
 @bot.tree.command(name="set_github_channel", description="Set the channel for GitHub updates")
