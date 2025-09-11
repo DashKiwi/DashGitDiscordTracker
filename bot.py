@@ -53,65 +53,70 @@ async def check_commits():
         cursor = await db.execute("SELECT id, github_username, discord_id, last_event_id FROM github_accounts")
         accounts = await cursor.fetchall()
 
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+    now = datetime.utcnow()
+
     for acc_id, username, discord_id, last_event_id in accounts:
-        print(f"🔍 Checking repos for {username}")
         repos = await get_public_repos(username)
         if not repos:
             print(f"No public repos found for {username}")
             continue
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT id, github_username, discord_id, last_event_id FROM github_accounts")
-            accounts = await cursor.fetchall()
-            for acc_id, username, discord_id, last_event_id in accounts:
-                print(f"🔹 {username} (Discord ID: {discord_id}) current last_event_id in DB: {last_event_id}")
-
-
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
         async with aiohttp.ClientSession() as session:
-            new_events = []
-            for repo in repos:
-                repo_url = f"https://api.github.com/repos/{username}/{repo}/events"
-                async with session.get(repo_url, headers=headers) as resp:
-                    if resp.status != 200:
-                        print(f"⚠️ Failed to fetch events for {repo}: {resp.status}")
-                        continue
-                    events = await resp.json()
-                    for event in events:
-                        if event["type"] == "PushEvent":
-                            if last_event_id and event["id"] == last_event_id:
-                                break
-                            new_events.append((repo, event))
+            new_commits = []
 
-            if new_events:
-                # Update last_event_id in DB
-                newest_event_id = new_events[0][1]["id"]
+            for repo in repos:
+                commits_url = f"https://api.github.com/repos/{username}/{repo}/commits?per_page=10"
+                async with session.get(commits_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        print(f"⚠️ Failed to fetch commits for {repo}: {resp.status}")
+                        continue
+                    commits = await resp.json()
+                    for commit in commits:
+                        sha = commit["sha"]
+                        commit_date = datetime.strptime(commit["commit"]["author"]["date"], "%Y-%m-%dT%H:%M:%SZ")
+                        if last_event_id and sha == last_event_id:
+                            break  # stop once we reach last seen commit
+                        if now - commit_date <= timedelta(days=1):  # only last 24 hours
+                            new_commits.append((repo, commit, commit_date))
+
+            if new_commits:
+                # Only take the newest commit per repo
+                newest_commits = {}
+                for repo_name, commit, commit_date in new_commits:
+                    if repo_name not in newest_commits or commit_date > newest_commits[repo_name][1]:
+                        newest_commits[repo_name] = (commit, commit_date)
+
+                # Update last_event_id to the most recent commit overall
+                most_recent_sha = max(newest_commits.values(), key=lambda x: x[1])[0]["sha"]
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
                         "UPDATE github_accounts SET last_event_id = ? WHERE id = ?",
-                        (newest_event_id, acc_id)
+                        (most_recent_sha, acc_id)
                     )
                     await db.commit()
 
                 # Determine Discord channel
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cursor = await db.execute(
-                        "SELECT update_channel_id FROM settings WHERE guild_id = ?",
-                        (bot.guilds[0].id,)
+                channel = None
+                if bot.guilds:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        cursor = await db.execute(
+                            "SELECT update_channel_id FROM settings WHERE guild_id = ?",
+                            (bot.guilds[0].id,)
+                        )
+                        row = await cursor.fetchone()
+                        channel_id = row[0] if row else None
+                    channel = bot.get_channel(channel_id) if channel_id else discord.utils.get(
+                        bot.guilds[0].channels, name="github-activity"
                     )
-                    row = await cursor.fetchone()
-                    channel_id = row[0] if row else None
-
-                channel = bot.get_channel(channel_id) if channel_id else discord.utils.get(
-                    bot.guilds[0].channels, name="github-activity"
-                )
 
                 if channel:
-                    for repo_name, event in reversed(new_events):  # oldest first
-                        commit_msgs = [c["message"] for c in event["payload"]["commits"]]
-                        msg = "\n".join([f"- {m}" for m in commit_msgs])
-                        await channel.send(f"🔨 **{username}** pushed to **{repo_name}**:\n{msg}")
-                        print(f"Posted {len(commit_msgs)} commits to Discord for {username}/{repo_name}")
+                    for repo_name, (commit, commit_date) in newest_commits.items():
+                        message = commit["commit"]["message"]
+                        author_name = commit["commit"]["author"]["name"]
+                        html_url = commit["html_url"]
+                        await channel.send(f"🔨 **{username}** pushed to **{repo_name}** by **{author_name}**:\n- {message}\n<{html_url}>")
+                        print(f"Posted commit to Discord for {username}/{repo_name}")
 
 # -------------------- EVENTS --------------------
 @bot.event
@@ -144,11 +149,54 @@ async def get_public_repos(username):
 @bot.tree.command(name="add_github", description="Link a GitHub account to a Discord user")
 @commands.has_permissions(administrator=True)
 async def add_github(interaction: discord.Interaction, github_username: str, user: discord.Member = None):
+    await interaction.response.defer()
     discord_id = user.id if user else None
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO github_accounts (github_username, discord_id) VALUES (?, ?)", (github_username, discord_id))
+        cursor = await db.execute(
+            "INSERT INTO github_accounts (github_username, discord_id, last_event_id) VALUES (?, ?, ?)",
+            (github_username, discord_id, None)
+        )
+        acc_id = cursor.lastrowid
         await db.commit()
-    await interaction.response.send_message(f"✅ Linked **{github_username}** to {user.mention if user else 'no one'}")
+
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+
+    # Fetch all public repos
+    public_repos = await get_public_repos(github_username)
+    if not public_repos:
+        await interaction.followup.send(f"❌ No public repos found for {github_username}")
+        return
+
+    newest_event_id = None
+
+    async with aiohttp.ClientSession() as session:
+        for repo in public_repos:
+            repo_url = f"https://api.github.com/repos/{github_username}/{repo}/events"
+            async with session.get(repo_url, headers=headers) as resp:
+                if resp.status != 200:
+                    continue
+                events = await resp.json()
+                for event in events:
+                    if event["type"] == "PushEvent":
+                        # Always keep the newest event ID (highest/latest)
+                        if not newest_event_id or event["created_at"] > newest_event_id:
+                            newest_event_id = event["id"]
+                        break  # only need the latest PushEvent per repo
+
+    # Update DB with the newest event ID
+    if newest_event_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE github_accounts SET last_event_id = ? WHERE id = ?",
+                (newest_event_id, acc_id)
+            )
+            await db.commit()
+        print(f"First-run setup for {github_username}, storing last_event_id {newest_event_id}")
+
+    await interaction.followup.send(
+        f"✅ Linked **{github_username}** to {user.mention if user else 'no one'}"
+    )
 
 @bot.tree.command(name="remove_github", description="Remove a GitHub account")
 @commands.has_permissions(administrator=True)
