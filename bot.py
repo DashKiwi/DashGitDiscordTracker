@@ -53,57 +53,58 @@ async def check_commits():
         cursor = await db.execute("SELECT id, github_username, discord_id, last_event_id FROM github_accounts")
         accounts = await cursor.fetchall()
 
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    for acc_id, username, discord_id, last_event_id in accounts:
+        print(f"🔍 Checking repos for {username}")
+        repos = await get_public_repos(username)
+        if not repos:
+            print(f"No public repos found for {username}")
+            continue
 
-    async with aiohttp.ClientSession() as session:
-        for acc in accounts:
-            acc_id, username, discord_id, last_event_id = acc
-            url = f"https://api.github.com/users/{username}/events"
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    print(f"⚠️ Failed to fetch events for {username}: {resp.status}")
-                    continue
-                events = await resp.json()
-                if not events:
-                    continue
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+        async with aiohttp.ClientSession() as session:
+            new_events = []
+            for repo in repos:
+                repo_url = f"https://api.github.com/repos/{username}/{repo}/events"
+                async with session.get(repo_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        print(f"⚠️ Failed to fetch events for {repo}: {resp.status}")
+                        continue
+                    events = await resp.json()
+                    for event in events:
+                        if event["type"] == "PushEvent":
+                            if last_event_id and event["id"] == last_event_id:
+                                break
+                            new_events.append((repo, event))
 
-                # Collect all new push events since last_event_id
-                new_events = []
-                for event in events:
-                    if event["type"] == "PushEvent":
-                        if last_event_id and event["id"] == last_event_id:
-                            break  # stop at last seen event
-                        new_events.append(event)
-
-                if new_events:
-                    # Update last_event_id to the newest fetched event
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute(
-                            "UPDATE github_accounts SET last_event_id = ? WHERE id = ?",
-                            (new_events[0]["id"], acc_id)
-                        )
-                        await db.commit()
-
-                    # Determine update channel
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        cursor = await db.execute(
-                            "SELECT update_channel_id FROM settings WHERE guild_id = ?",
-                            (bot.guilds[0].id,)
-                        )
-                        row = await cursor.fetchone()
-                        channel_id = row[0] if row else None
-
-                    channel = bot.get_channel(channel_id) if channel_id else discord.utils.get(
-                        bot.guilds[0].channels, name="github-activity"
+            if new_events:
+                # Update last_event_id in DB
+                newest_event_id = new_events[0][1]["id"]
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE github_accounts SET last_event_id = ? WHERE id = ?",
+                        (newest_event_id, acc_id)
                     )
+                    await db.commit()
 
-                    if channel:
-                        # Send events oldest first
-                        for event in reversed(new_events):
-                            repo = event["repo"]["name"]
-                            commit_msgs = [c["message"] for c in event["payload"]["commits"]]
-                            msg = "\n".join([f"- {m}" for m in commit_msgs])
-                            await channel.send(f"🔨 **{username}** pushed to **{repo}**:\n{msg}")
+                # Determine Discord channel
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cursor = await db.execute(
+                        "SELECT update_channel_id FROM settings WHERE guild_id = ?",
+                        (bot.guilds[0].id,)
+                    )
+                    row = await cursor.fetchone()
+                    channel_id = row[0] if row else None
+
+                channel = bot.get_channel(channel_id) if channel_id else discord.utils.get(
+                    bot.guilds[0].channels, name="github-activity"
+                )
+
+                if channel:
+                    for repo_name, event in reversed(new_events):  # oldest first
+                        commit_msgs = [c["message"] for c in event["payload"]["commits"]]
+                        msg = "\n".join([f"- {m}" for m in commit_msgs])
+                        await channel.send(f"🔨 **{username}** pushed to **{repo_name}**:\n{msg}")
+                        print(f"Posted {len(commit_msgs)} commits to Discord for {username}/{repo_name}")
 
 # -------------------- EVENTS --------------------
 @bot.event
@@ -119,6 +120,18 @@ async def on_ready():
 async def setup_hook():
     await init_db()
     check_commits.start()
+
+# -------------------- HELPER: FETCH PUBLIC REPOS --------------------
+async def get_public_repos(username):
+    url = f"https://api.github.com/users/{username}/repos?per_page=100&type=owner"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                print(f"⚠️ Failed to fetch repos for {username}: {resp.status}")
+                return []
+            repos = await resp.json()
+            return [repo["name"] for repo in repos if not repo["private"]]
 
 # -------------------- SLASH COMMANDS --------------------
 @bot.tree.command(name="add_github", description="Link a GitHub account to a Discord user")
