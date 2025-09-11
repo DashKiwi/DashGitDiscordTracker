@@ -58,7 +58,7 @@ async def check_commits():
     async with aiohttp.ClientSession() as session:
         for acc in accounts:
             acc_id, username, discord_id, last_event_id = acc
-            url = f"https://api.github.com/users/{username}/events/public"
+            url = f"https://api.github.com/users/{username}/events"
             async with session.get(url, headers=headers) as resp:
                 if resp.status != 200:
                     print(f"⚠️ Failed to fetch events for {username}: {resp.status}")
@@ -67,16 +67,16 @@ async def check_commits():
                 if not events:
                     continue
 
-                # Collect new push events
+                # Collect all new push events since last_event_id
                 new_events = []
                 for event in events:
                     if event["type"] == "PushEvent":
                         if last_event_id and event["id"] == last_event_id:
-                            break
+                            break  # stop at last seen event
                         new_events.append(event)
 
                 if new_events:
-                    # Update last_event_id in database
+                    # Update last_event_id to the newest fetched event
                     async with aiosqlite.connect(DB_PATH) as db:
                         await db.execute(
                             "UPDATE github_accounts SET last_event_id = ? WHERE id = ?",
@@ -98,6 +98,7 @@ async def check_commits():
                     )
 
                     if channel:
+                        # Send events oldest first
                         for event in reversed(new_events):
                             repo = event["repo"]["name"]
                             commit_msgs = [c["message"] for c in event["payload"]["commits"]]
