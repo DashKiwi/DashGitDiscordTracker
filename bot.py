@@ -77,7 +77,7 @@ async def check_commits():
                         commit_date = datetime.strptime(commit["commit"]["author"]["date"], "%Y-%m-%dT%H:%M:%SZ")
                         if last_event_id and sha == last_event_id:
                             break  # stop once we reach last seen commit
-                        if now - commit_date <= timedelta(days=1):  # only last 24 hours
+                        if now - commit_date <= timedelta(days=7):  # only last week
                             new_commits.append((repo, commit, commit_date))
 
             if new_commits:
