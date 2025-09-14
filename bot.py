@@ -1,4 +1,5 @@
 import discord
+from discord.ui import View, Button
 from discord.ext import commands, tasks
 import aiosqlite
 import os
@@ -133,6 +134,76 @@ async def setup_hook():
     await init_db()
     check_commits.start()
 
+# -------------------- GAMES --------------------
+class TicTacToeButton(Button):
+    def __init__(self, x, y):
+        super().__init__(label="⬜", style=discord.ButtonStyle.secondary, row=y)
+        self.x = x
+        self.y = y
+
+    async def callback(self, interaction: discord.Interaction):
+        view: TicTacToe = self.view
+        if view.current_player != interaction.user:
+            await interaction.response.send_message("❌ It's not your turn!", ephemeral=True)
+            return
+
+        if view.board[self.y][self.x] != "⬜":
+            await interaction.response.send_message("❌ That spot is already taken!", ephemeral=True)
+            return
+
+        symbol = "❌" if view.turn % 2 == 0 else "⭕"
+        self.label = symbol
+        self.style = discord.ButtonStyle.danger if symbol == "❌" else discord.ButtonStyle.primary
+        self.disabled = True
+        view.board[self.y][self.x] = symbol
+        view.turn += 1
+
+        winner = view.check_winner()
+        if winner:
+            for child in view.children:
+                child.disabled = True
+            await interaction.response.edit_message(content=f"🎉 {interaction.user.mention} wins with {symbol}!", view=view)
+            view.stop()
+            return
+        elif view.turn >= 9:
+            for child in view.children:
+                child.disabled = True
+            await interaction.response.edit_message(content="🤝 It's a draw!", view=view)
+            view.stop()
+            return
+
+        view.current_player = view.player1 if view.current_player == view.player2 else view.player2
+        await interaction.response.edit_message(content=f"Next turn: {view.current_player.mention}", view=view)
+
+
+class TicTacToe(View):
+    def __init__(self, player1, player2):
+        super().__init__(timeout=180)  # 3 minutes max
+        self.player1 = player1
+        self.player2 = player2
+        self.current_player = player1
+        self.turn = 0
+        self.board = [["⬜"] * 3 for _ in range(3)]
+
+        for y in range(3):
+            for x in range(3):
+                self.add_item(TicTacToeButton(x, y))
+
+    def check_winner(self):
+        lines = []
+        # rows and cols
+        for i in range(3):
+            lines.append(self.board[i])  # row
+            lines.append([self.board[0][i], self.board[1][i], self.board[2][i]])  # col
+        # diagonals
+        lines.append([self.board[0][0], self.board[1][1], self.board[2][2]])
+        lines.append([self.board[0][2], self.board[1][1], self.board[2][0]])
+
+        for line in lines:
+            if line[0] != "⬜" and line.count(line[0]) == 3:
+                return line[0]
+        return None
+
 # -------------------- HELPER: FETCH PUBLIC REPOS --------------------
 async def get_public_repos(username):
     url = f"https://api.github.com/users/{username}/repos?per_page=100&type=owner"
@@ -197,6 +268,23 @@ async def add_github(interaction: discord.Interaction, github_username: str, use
     await interaction.followup.send(
         f"✅ Linked **{github_username}** to {user.mention if user else 'no one'}"
     )
+
+@bot.tree.command(name="game", description="Play a game with someone")
+@discord.app_commands.describe(game_name="Choose which game to play", opponent="Who do you want to play against?")
+@discord.app_commands.choices(game_name=[
+    discord.app_commands.Choice(name="Tic-Tac-Toe", value="tictactoe"),
+    discord.app_commands.Choice(name="Rock-Paper-Scissors", value="rps"),
+])
+async def game(interaction: discord.Interaction, game_name: discord.app_commands.Choice[str], opponent: discord.Member):
+    if game_name.value == "tictactoe":
+        view = TicTacToe(interaction.user, opponent)
+        await interaction.response.send_message(
+            f"🎮 Tic-Tac-Toe started between {interaction.user.mention} and {opponent.mention}!\n"
+            f"{interaction.user.mention} goes first as ❌",
+            view=view
+        )
+    else:
+        await interaction.response.send_message(f"❌ Unknown game: {game_name.value}")
 
 @bot.tree.command(name="remove_github", description="Remove a GitHub account")
 @commands.has_permissions(administrator=True)
