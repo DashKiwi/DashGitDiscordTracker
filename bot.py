@@ -135,6 +135,70 @@ async def setup_hook():
     check_commits.start()
 
 # -------------------- GAMES --------------------
+class RPSView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, opponent: discord.Member):
+        super().__init__(timeout=180)  # 3 min to play
+        self.challenger = challenger
+        self.opponent = opponent
+        self.choices = {}  # user.id -> choice
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user not in [self.challenger, self.opponent]:
+            await interaction.response.send_message("❌ You are not part of this game!", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if hasattr(self, "message"):
+            await self.message.edit(content="⌛ Rock-Paper-Scissors timed out due to inactivity.", view=self)
+        self.stop()
+
+    async def make_choice(self, interaction: discord.Interaction, choice: str):
+        self.choices[interaction.user.id] = choice
+
+        await interaction.response.defer()
+
+        # When both players chose, decide winner
+        if len(self.choices) == 2:
+            c1 = self.choices[self.challenger.id]
+            c2 = self.choices[self.opponent.id]
+
+            result = self.get_winner(c1, c2)
+            msg = (
+                f"✊ {self.challenger.mention} chose **{c1}**\n"
+                f"✋ {self.opponent.mention} chose **{c2}**\n\n"
+            )
+            if result == 0:
+                msg += "🤝 It's a **draw**!"
+            elif result == 1:
+                msg += f"🎉 {self.challenger.mention} wins!"
+            else:
+                msg += f"🎉 {self.opponent.mention} wins!"
+
+            for child in self.children:
+                child.disabled = True
+            await interaction.message.edit(content=msg, view=self)
+            self.stop()
+
+    def get_winner(self, c1, c2):
+        if c1 == c2:
+            return 0
+        if (c1 == "Rock" and c2 == "Scissors") or \
+           (c1 == "Paper" and c2 == "Rock") or \
+           (c1 == "Scissors" and c2 == "Paper"):
+            return 1
+        return 2
+
+class RPSButton(discord.ui.Button):
+    def __init__(self, label, emoji):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, emoji=emoji)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RPSView = self.view
+        await view.make_choice(interaction, self.label)
+
 class TicTacToeButton(Button):
     def __init__(self, x, y):
         super().__init__(label="⬜", style=discord.ButtonStyle.secondary, row=y)
@@ -189,6 +253,12 @@ class TicTacToe(View):
             for x in range(3):
                 self.add_item(TicTacToeButton(x, y))
 
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if hasattr(self, "message"):
+            await self.message.edit(content="⌛ Tic-Tac-Toe timed out due to inactivity.", view=self)
+        self.stop()
     def check_winner(self):
         lines = []
         # rows and cols
@@ -283,6 +353,19 @@ async def game(interaction: discord.Interaction, game_name: discord.app_commands
             f"{interaction.user.mention} goes first as ❌",
             view=view
         )
+
+    elif game_name.value == "rps":
+        view = RPSView(interaction.user, opponent)
+        view.add_item(RPSButton("Rock", "✊"))
+        view.add_item(RPSButton("Paper", "✋"))
+        view.add_item(RPSButton("Scissors", "✌️"))
+
+        await interaction.response.send_message(
+            f"✊✋✌ {interaction.user.mention} challenges {opponent.mention} to Rock–Paper–Scissors!\n"
+            "Both players, click your choice!",
+            view=view
+        )
+
     else:
         await interaction.response.send_message(f"❌ Unknown game: {game_name.value}")
 
